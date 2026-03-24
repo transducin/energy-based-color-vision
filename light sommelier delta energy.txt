@@ -1,0 +1,920 @@
+# ================================================================
+# Cell 1 — Imports + Global Configuration
+# light sommelier delta energy (Part 3)
+# ================================================================
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+# --- Random Seed (global for reproducibility) ---
+rng = np.random.default_rng(42)
+
+# --- Wavelength Grid ---
+wl_min, wl_max, wl_step = 380, 700, 5
+wavelengths = np.arange(wl_min, wl_max + wl_step, wl_step)
+n_wl = len(wavelengths)
+
+print("Cell 1 OK — Global imports + wavelength grid initialized.")
+print("Wavelength grid size:", n_wl, "points")
+
+# ================================================================
+# Cell 2 — Spectral Module (Clean Build)
+# light sommelier delta energy (Part 3)
+# ================================================================
+
+import numpy as np
+
+# 使用 Cell 1 中的 rng, wavelengths, n_wl
+
+# ------------------------------------------------
+# Gaussian 光谱生成器
+# ------------------------------------------------
+def make_gaussian_spectrum(center_nm, width_nm=20.0, peak=1.0):
+    """
+    生成高斯窄带光谱。
+    """
+    sigma = width_nm / 2.355
+    return peak * np.exp(-0.5 * ((wavelengths - center_nm) / sigma) ** 2)
+
+
+# ------------------------------------------------
+# 生成随机 batch 的工具函数
+# ------------------------------------------------
+def make_batch_centers(n_centers=10, wl_lo=420, wl_hi=680):
+    """
+    生成用于 batch 刺激的中心波长列表（等距分布）。
+    """
+    return np.linspace(wl_lo, wl_hi, n_centers)
+
+
+def make_stimuli_batch(centers,
+                       n_repeats=6,
+                       intensities=(0.5, 0.8),
+                       noise_power=0.02):
+    """
+    基于中心波长生成多光谱 batch。
+    """
+    batch = []
+    for c in centers:
+        for peak in intensities:
+            for _ in range(n_repeats):
+                spec = make_gaussian_spectrum(c, width_nm=22, peak=peak)
+                spec = np.clip(
+                    spec + rng.normal(0, noise_power, size=spec.shape),
+                    0, None
+                )
+                batch.append({'wl_center': float(c), 'spectrum': spec})
+    rng.shuffle(batch)
+    return batch
+
+
+# ------------------------------------------------
+# Two-Level Mixing 复杂光谱（升级版）
+# ------------------------------------------------
+def make_twolevel_mix():
+    """
+    构建具有两层混合结构的复杂光谱：
+    (1) 同色频带的强/弱叠加  → Δ1 ↑
+    (2) 异色频带的跨类叠加  → RG/BY 震荡 ↑
+    """
+    # 一级混合（同波段强弱）
+    blue_strong = make_gaussian_spectrum(450, width_nm=25, peak=1.2)
+    blue_weak   = make_gaussian_spectrum(450, width_nm=25, peak=0.4)
+
+    # 二级混合（跨类别）
+    green_mid   = make_gaussian_spectrum(530, width_nm=22, peak=0.8)
+    red_strong  = make_gaussian_spectrum(610, width_nm=35, peak=1.0)
+
+    # 组合权重可调，这里使用较稳定的组合
+    spec = (
+        1.0 * blue_strong +
+        0.6 * blue_weak   +
+        0.7 * green_mid   +
+        1.0 * red_strong
+    )
+
+    return np.clip(spec, 0, None)
+
+
+# ------------------------------------------------
+# 测试 Two-Level Mixing 光谱
+# ------------------------------------------------
+complex_spec = make_twolevel_mix()
+
+print("Cell 2 OK — Spectral module ready.")
+print("Complex spectrum min/max:", complex_spec.min(), complex_spec.max())
+print("Wavelength points:", len(wavelengths))
+
+# ================================================================
+# Cell 3 — Receptor Bank + Pooling
+# light sommelier delta energy (Part 3)
+# ================================================================
+
+import numpy as np
+
+# 使用 Cell 1 中的:
+# - rng
+# - wavelengths, n_wl
+
+# ------------------------------------------------
+# Gaussian 敏感度生成器
+# ------------------------------------------------
+def gaussian_sensitivity(center_nm, width_nm=40.0):
+    """
+    生成单个受体的光谱敏感度。
+    """
+    sigma = width_nm / 2.355
+    return np.exp(-0.5 * ((wavelengths - center_nm) / sigma) ** 2)
+
+
+# ------------------------------------------------
+# 构建 Receptor Bank（S/M/L 每簇 n_per_group 个）
+# ------------------------------------------------
+def make_receptor_bank(n_per_group=4, jitter=10.0, width_nm=40.0):
+    """
+    构建三簇受体：
+      S-簇中心: 440 nm
+      M-簇中心: 530 nm
+      L-簇中心: 560 nm
+    每簇 n_per_group 个受体，中心波长带 jitter。
+    """
+    S_center, M_center, L_center = 440, 530, 560
+    base_centers = [S_center, M_center, L_center]
+
+    centers = []
+    for base in base_centers:
+        centers.extend(base + rng.normal(0, jitter, size=n_per_group))
+
+    centers = np.array(centers)
+
+    sens = np.stack(
+        [gaussian_sensitivity(c, width_nm=width_nm) for c in centers],
+        axis=0
+    )
+
+    # Normalize each receptor channel
+    sens = sens / (sens.max(axis=1, keepdims=True) + 1e-9)
+
+    return sens, centers
+
+
+# ------------------------------------------------
+# Pooling：12 个受体 → 3 个簇（S/M/L）
+# ------------------------------------------------
+def build_cluster_map(n_per_group=4):
+    """
+    建立 receptor → cluster 的映射表。
+    """
+    return np.array([0]*n_per_group + [1]*n_per_group + [2]*n_per_group)
+
+
+def pool_to_clusters(receptor_ts, cluster_map):
+    """
+    输入:
+        receptor_ts: shape [T, n_receptors]
+        cluster_map: 长度 n_receptors 的数组, 值域 {0,1,2}
+
+    输出:
+        pooled: shape [T, 3]
+    """
+    T, n_rec = receptor_ts.shape
+    n_clusters = 3
+    pooled = np.zeros((T, n_clusters))
+
+    for k in range(n_clusters):
+        idx = np.where(cluster_map == k)[0]
+        pooled[:, k] = receptor_ts[:, idx].mean(axis=1)
+
+    return pooled
+
+
+# ------------------------------------------------
+# 构建 receptor bank + cluster map
+# ------------------------------------------------
+receptor_sens, receptor_centers = make_receptor_bank(
+    n_per_group=4,
+    jitter=10.0,
+    width_nm=40.0
+)
+cluster_map = build_cluster_map(n_per_group=4)
+
+print("Cell 3 OK — receptor bank + pooling ready.")
+print("Receptor matrix shape:", receptor_sens.shape)
+print("Cluster map:", cluster_map)
+
+# ================================================================
+# Cell 4 — Energy Module (Δ2-ready, Clean Build)
+# light sommelier delta energy (Part 3)
+# ================================================================
+
+import numpy as np
+
+# 使用全局 wavelengths
+# h, c 使用正常物理量 + 缩放，避免数值爆炸
+h = 6.626e-34        # Planck constant
+c = 3e8              # speed of light
+energy_scale = 1e27  # scaled so numeric range is usable
+
+
+# ------------------------------------------------
+# Photon Energy
+# ------------------------------------------------
+def photon_energy(wavelengths_nm):
+    """
+    光子能量 E = hc/λ，并进行缩放。
+    输入单位 nm，会转换为 m。
+    """
+    wavelengths_m = wavelengths_nm * 1e-9
+    E = (h * c) / wavelengths_m
+    return E * energy_scale
+
+
+# ------------------------------------------------
+# 能态更新（无噪声版本）
+# ------------------------------------------------
+def update_energy(E_prev, processing_cost, recovery=0.001):
+    """
+    E(t+1) = E(t) - cost + recovery
+    并限制到 [0, 1]
+    """
+    E_new = E_prev - processing_cost + recovery
+    return float(np.clip(E_new, 0.0, 1.0))
+
+
+# ------------------------------------------------
+# 能态更新（带噪声版本，用于资源不定性实验）
+# ------------------------------------------------
+def update_energy_with_noise(E_prev,
+                             processing_cost,
+                             recovery=0.001,
+                             noise_sigma=0.01):
+    """
+    在能态更新后加入轻微噪声，用于资源不定性实验。
+    噪声 ∼ N(0, noise_sigma)
+    """
+    E_new = E_prev - processing_cost + recovery
+    E_new += rng.normal(0, noise_sigma)
+    return float(np.clip(E_new, 0.0, 1.0))
+
+
+# ------------------------------------------------
+# Δ2（能态导数）计算辅助函数
+# ------------------------------------------------
+def compute_delta2(Energy_seq):
+    """
+    输入：Energy_seq (list or array)
+    输出：Δ2 序列，长度 T，第一项为 0（无前项可比）
+    """
+    Energy_seq = np.array(Energy_seq)
+    d2 = np.zeros_like(Energy_seq)
+    if len(Energy_seq) > 1:
+        d2[1:] = Energy_seq[1:] - Energy_seq[:-1]
+    return d2
+
+
+print("Cell 4 OK — Energy module ready.")
+
+# ================================================================
+# Cell 5 — Mitral Dynamics + Opponent Channels
+# light sommelier delta energy (Part 3)
+# ================================================================
+
+import numpy as np
+
+# ------------------------------------------------
+# Mitral Cell Dynamics
+# ------------------------------------------------
+def run_mitral_dynamics(cluster_acts, alpha=0.3, inhib=0.4):
+    """
+    输入:
+        cluster_acts: shape [T, 3], 分别对应 S/M/L 三簇输入
+
+    输出:
+        mitral_ts: shape [T, 3]
+    """
+    T = cluster_acts.shape[0]
+
+    # 简单前馈权重（对角）
+    W_in = np.eye(3)
+
+    # 侧抑矩阵：全连接抑制（无对角）
+    L = inhib * (np.ones((3, 3)) - np.eye(3))
+
+    # 初值
+    m = np.zeros(3)
+    mitral_ts = []
+
+    for t in range(T):
+        drive = W_in @ cluster_acts[t]    # 前馈
+        lateral = L @ m                   # 侧抑
+        m = (1 - alpha) * m + alpha * np.maximum(0, drive - lateral)
+        mitral_ts.append(m.copy())
+
+    return np.stack(mitral_ts, axis=0)
+
+
+# ------------------------------------------------
+# Opponent Channels
+# ------------------------------------------------
+def opponent_channels(mitral_ts):
+    """
+    输入:
+        mitral_ts: shape [T, 3]
+    输出:
+        RG, BY, LUM: 各为长度 T 的数组
+    """
+    S = mitral_ts[:, 0]
+    M = mitral_ts[:, 1]
+    L = mitral_ts[:, 2]
+
+    RG = L - M
+    BY = 0.5 * (L + M) - S
+    LUM = L + M + S
+
+    return {
+        'RG': RG,
+        'BY': BY,
+        'LUM': LUM
+    }
+
+
+print("Cell 5 OK — Mitral dynamics + opponent channels ready.")
+
+# ================================================================
+# Cell 6 — Soft-Gate Decision Layer (Δ2 sign-flip integrated)
+# light sommelier delta energy (Part 3)
+# ================================================================
+
+import numpy as np
+
+# ------------------------------------------------
+# Sigmoid
+# ------------------------------------------------
+def sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+# ------------------------------------------------
+# Soft-Gate 核心：Δ1 + Δ2
+# ------------------------------------------------
+def soft_gate_core(delta1, delta2, gamma1=5.0, gamma2=5.0):
+    """
+    F = exp(-γ1 * |Δ1|) * sigmoid(-γ2 * Δ2)
+    """
+    return np.exp(-gamma1 * abs(delta1)) * sigmoid(-gamma2 * delta2)
+
+
+# ------------------------------------------------
+# Instability Gate: Δ₂ 符号反转敏感
+# ------------------------------------------------
+def soft_gate_instability(F, delta2_prev, delta2_now, penalty=0.5):
+    """
+    如果 Δ2 符号反转（能态趋势不稳定） → 加强 early stop 的概率。
+
+    penalty < 1 → 更容易提前终止
+    """
+    if np.sign(delta2_prev) != np.sign(delta2_now):
+        return F * penalty
+    return F
+
+
+# ------------------------------------------------
+# 动态阈值（随能态提高）
+# ------------------------------------------------
+def compute_threshold(E_t, base_thresh=0.15):
+    return base_thresh + 0.20 * E_t
+
+
+# ------------------------------------------------
+# 决策竞争动力学（BW vs COLOR）
+# ------------------------------------------------
+def decision_competition_energy_v2(
+        RG, BY, LUM,
+        Energy_seq,
+        gamma1=5.0, gamma2=5.0,
+        alpha_dec=0.25,
+        inhib_dec=0.6,
+        theta_F=0.3,
+        instability_penalty=0.5):
+    """
+    输出：
+        BW_ts, COLOR_ts, RG_fb, BY_fb, F_values, stop_t
+    """
+
+    T = len(RG)
+
+    # 初始化
+    BW = 0.1
+    COLOR = 0.1
+
+    BW_ts = []
+    COLOR_ts = []
+    RG_fb = RG.copy()
+    BY_fb = BY.copy()
+    F_values = []
+    stop_t = None
+
+    # Δ₂ tracking
+    delta2_prev = 0.0
+
+    for t in range(T):
+
+        E_t = Energy_seq[t]
+        thresh = compute_threshold(E_t)
+
+        # ------------ 1. 决策驱动 ------------
+        drive_bw = (1.0 * LUM[t] - 0.6 * RG[t] - 0.6 * BY[t])
+        drive_color = (1.2 * RG[t] + 1.2 * BY[t])
+
+        comp_strength = inhib_dec * (0.5 + 0.5 * E_t)
+
+        # ------------ 2. 动力系统更新 ------------
+        BW = (1 - alpha_dec) * BW + alpha_dec * max(0, drive_bw - comp_strength * COLOR)
+        COLOR = (1 - alpha_dec) * COLOR + alpha_dec * max(0, drive_color - comp_strength * BW)
+
+        BW_ts.append(BW)
+        COLOR_ts.append(COLOR)
+
+        # ------------ 3. Soft‑Gate Δ1, Δ2 ------------
+        if t > 0:
+            delta1 = abs((COLOR_ts[t] - BW_ts[t]) -
+                         (COLOR_ts[t-1] - BW_ts[t-1]))
+            delta2_now = Energy_seq[t] - Energy_seq[t-1]
+
+            # 基础 soft‑gate
+            F_t = soft_gate_core(delta1, delta2_now, gamma1, gamma2)
+
+            # Δ₂ 符号反转敏感
+            F_t = soft_gate_instability(F_t, delta2_prev, delta2_now,
+                                        penalty=instability_penalty)
+
+            F_values.append(F_t)
+
+            # ---- 终止判定 ----
+            if F_t < theta_F:
+                stop_t = t
+                print(f"[Soft-Gate] Terminated at t = {t}  (F = {F_t:.4f})")
+
+                # 截断
+                BW_ts = BW_ts[:t+1]
+                COLOR_ts = COLOR_ts[:t+1]
+                RG_fb = RG_fb[:t+1]
+                BY_fb = BY_fb[:t+1]
+
+                return (
+                    np.array(BW_ts),
+                    np.array(COLOR_ts),
+                    np.array(RG_fb),
+                    np.array(BY_fb),
+                    F_values,
+                    stop_t
+                )
+
+            delta2_prev = delta2_now
+
+        else:
+            # 第 0 步无 Δ1/Δ2
+            F_values.append(None)
+
+        # ------------ 4. 能态反向塑形（feedback）------------
+        fb_gain = 0.10 + 0.30 * E_t
+        delta = COLOR - BW
+
+        RG_fb[t] = RG[t] + fb_gain * delta
+        BY_fb[t] = BY[t] + fb_gain * delta
+
+    # 若未提前终止
+    return (
+        np.array(BW_ts),
+        np.array(COLOR_ts),
+        np.array(RG_fb),
+        np.array(BY_fb),
+        F_values,
+        stop_t
+    )
+
+
+print("Cell 6 OK — Soft-Gate v2 (Δ2 sign-flip) ready.")
+
+# ================================================================
+# Cell 7 — Energy Pipeline (Δ2-ready, Clean Build)
+# light sommelier delta energy (Part 3)
+# ================================================================
+
+import numpy as np
+
+# 使用先前 Cells 中导入的:
+# - receptor_sens
+# - cluster_map
+# - update_energy / update_energy_with_noise
+# - compute_delta2
+# - run_mitral_dynamics
+# - opponent_channels
+# - decision_competition_energy_v2
+# - photon_energy
+
+
+# ------------------------------------------------
+# 受体层：响应函数（含能态调制 + photon energy）
+# ------------------------------------------------
+def receptor_response_with_energy(
+        spectrum,
+        receptor_sens,
+        wavelengths,
+        Energy_t):
+    """
+    输入：
+        spectrum: 光谱（长度 n_wl）
+        receptor_sens: shape [n_receptors, n_wl]
+        Energy_t: 当前能态
+
+    输出：
+        receptor activation shape [n_receptors]
+    """
+
+    # 光子能量组件（增加高能波段权重）
+    photon_E = photon_energy(wavelengths)
+    weighted_spec = spectrum * (0.3 + 0.7 * (photon_E / photon_E.max()))
+
+    # 受体基础响应
+    base = receptor_sens @ weighted_spec
+
+    # 能态调制敏感度锐度
+    sharpness = 0.5 + 0.5 * Energy_t  # ∈ [0.5, 1.0]
+    base = np.power(base, sharpness)
+
+    return np.clip(base, 0, None)
+
+
+# ------------------------------------------------
+# Activation Cost（用于能态更新）
+# ------------------------------------------------
+def activation_cost(
+        receptor_act,
+        mitral_prev,
+        BW_prev,
+        COLOR_prev,
+        w_rec=0.04,
+        w_mitral=0.05,
+        w_dec=0.08):
+    """
+    基于受体 / mitral / BW-COLOR 的激活强度计算能耗。
+    """
+    rec_cost = np.mean(np.abs(receptor_act))
+    mit_cost = np.mean(np.abs(mitral_prev))
+    dec_cost = (abs(BW_prev) + abs(COLOR_prev)) / 2.0
+
+    total_cost = (w_rec * rec_cost +
+                  w_mitral * mit_cost +
+                  w_dec * dec_cost)
+
+    return float(total_cost)
+
+
+# ------------------------------------------------
+# Energy Pipeline (主函数)
+# ------------------------------------------------
+def run_energy_pipeline(
+        spectrum,
+        receptor_sens,
+        wavelengths,
+        T=40,
+        gate=None,
+        use_energy_noise=False,
+        noise_sigma=0.01):
+    """
+    整个管线：
+      receptor → pooling → mitral → opponent → decision(Soft-Gate)
+    """
+
+    if gate is None:
+        gate = np.ones(T)
+
+    # ----- 初始化 -----
+    receptor_ts = []
+    Energy_seq = []
+    E_t = 1.0
+
+    BW_prev = 0.1
+    COLOR_prev = 0.1
+    mitral_prev = np.zeros(3)
+
+    # ============================
+    # (1) 受体层 + 能态更新
+    # ============================
+    for t in range(T):
+        # --- receptor activation ---
+        rec = receptor_response_with_energy(
+            spectrum,
+            receptor_sens,
+            wavelengths,
+            E_t
+        )
+        rec = rec * gate[t]
+        receptor_ts.append(rec)
+
+        # --- 能耗计算 ---
+        cost = activation_cost(
+            rec, mitral_prev, BW_prev, COLOR_prev
+        )
+
+        # --- 能态更新（可选噪声） ---
+        if use_energy_noise:
+            E_t = update_energy_with_noise(
+                E_t, cost,
+                recovery=0.001,
+                noise_sigma=noise_sigma
+            )
+        else:
+            E_t = update_energy(E_t, cost, recovery=0.001)
+
+        Energy_seq.append(E_t)
+
+    receptor_ts = np.stack(receptor_ts, axis=0)
+
+    # ============================
+    # (2) pooling to S/M/L clusters
+    # ============================
+    cluster_acts = pool_to_clusters(receptor_ts, cluster_map)
+
+    # ============================
+    # (3) mitral dynamics
+    # ============================
+    mitral_ts = run_mitral_dynamics(cluster_acts)
+    mitral_prev = mitral_ts[-1]
+
+    # ============================
+    # (4) Opponent channels
+    # ============================
+    opp = opponent_channels(mitral_ts)
+    RG = opp['RG']
+    BY = opp['BY']
+    LUM = opp['LUM']
+
+    # ============================
+    # (5) Soft-Gate 决策层 v2
+    # ============================
+    BW, COLOR, RG_fb, BY_fb, F_values, stop_t = \
+        decision_competition_energy_v2(
+            RG, BY, LUM,
+            Energy_seq
+        )
+
+    # ===== 更新 prev（用于下一 pipeline loop 时） =====
+    if len(BW) > 0:
+        BW_prev = BW[-1]
+        COLOR_prev = COLOR[-1]
+
+    # ============================
+    # 输出
+    # ============================
+    return (
+        RG, BY,
+        RG_fb, BY_fb,
+        BW, COLOR,
+        np.array(Energy_seq),
+        F_values,
+        stop_t
+    )
+
+
+print("Cell 7 OK — Energy Pipeline (Δ2-ready) is ready.")
+
+# ================================================================
+# Cell 8 — Plotting Module (Clean Build)
+# light sommelier delta energy (Part 3)
+# ================================================================
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+def plot_energy_trajectory(
+        RG, BY,
+        RG_fb, BY_fb,
+        BW, COLOR,
+        Energy_ts,
+        title="Energy Model Trajectory"):
+    """
+    三联图显示：
+      (1) RG/BY 中间态轨迹（含反馈前后）
+      (2) BW/COLOR 决策轨迹（含 early stop）
+      (3) 能态 Energy(t)
+    """
+
+    # --- 自适应时间轴 ---
+    T_dec = len(BW)
+    T_energy = len(Energy_ts)
+    t_dec = np.arange(T_dec)
+    t_energy = np.arange(T_energy)
+
+    # ---------------------------------------------------------------
+    # 画图
+    # ---------------------------------------------------------------
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+    # (1) RG-BY 中间态轨迹
+    ax = axes[0]
+    ax.plot(RG, BY, 'o--', alpha=0.4, label='原始 RG/BY')
+    ax.plot(RG_fb, BY_fb, 'o-', alpha=0.9, label='能态反向塑形')
+    ax.axhline(0, color='gray', lw=0.5)
+    ax.axvline(0, color='gray', lw=0.5)
+    ax.set_xlabel("RG (L - M)")
+    ax.set_ylabel("BY (0.5*(L+M) - S)")
+    ax.set_title("中间态轨迹")
+    ax.legend()
+
+    # (2) BW / COLOR 决策轨迹
+    ax = axes[1]
+    ax.plot(t_dec, BW, label='BW')
+    ax.plot(t_dec, COLOR, label='COLOR')
+    ax.set_xlabel("time")
+    ax.set_ylabel("activation")
+    ax.set_title("BW / COLOR 决策层")
+    ax.set_ylim(0, 1.0)
+    ax.legend()
+
+    # (3) 能态轨迹
+    ax = axes[2]
+    ax.plot(t_energy, Energy_ts, color='green')
+    ax.set_xlabel("time")
+    ax.set_ylabel("Energy(t)")
+    ax.set_title("能态轨迹")
+    ax.set_ylim(0, 1.0)
+
+    fig.suptitle(title, fontsize=14)
+    plt.tight_layout()
+    plt.show()
+
+print("Cell 8 OK — Plotting module ready.")
+
+# ================================================================
+# Cell 9 — End-to-End Test (Complex Spectrum)
+# light sommelier delta energy (Part 3)
+# ================================================================
+
+# 使用 complex_spec (Cell 2)
+# 使用 run_energy_pipeline (Cell 7)
+# 使用 plot_energy_trajectory (Cell 8)
+
+# ---- 相位门控（默认 sin^2 形态） ----
+def make_phase_gate(T=40, freq=1.0, phase=0.0):
+    """
+    gate(t) = sin^2( 2π * freq * (t/T) + phase )
+    并归一化到 [0.1, 1.0]
+    """
+    t = np.arange(T)
+    raw = np.sin(2 * np.pi * (freq * t / T) + phase) ** 2
+
+    # 归一化到 [0, 1]
+    raw_min, raw_max = raw.min(), raw.max()
+    if raw_max - raw_min < 1e-12:
+        norm = np.ones(T)
+    else:
+        norm = (raw - raw_min) / (raw_max - raw_min)
+
+    gate = 0.1 + 0.9 * norm
+    return gate
+
+
+T = 40
+phase_gate = make_phase_gate(T=T)
+
+# ---- 运行 delta-energy pipeline ----
+RG, BY, RG_fb, BY_fb, BW, COLOR, Energy_ts, F_values, stop_t = \
+    run_energy_pipeline(
+        complex_spec,
+        receptor_sens,
+        wavelengths,
+        T=T,
+        gate=phase_gate,
+        use_energy_noise=False  # 首次实验使用稳定能态
+    )
+
+# ---- 画三联图 ----
+plot_energy_trajectory(
+    RG, BY,
+    RG_fb, BY_fb,
+    BW, COLOR,
+    Energy_ts,
+    title="Delta-Energy Model (Complex Spectrum Test)"
+)
+
+print("\nSoft-Gate stop_t:", stop_t)
+print("Cell 9 OK — End-to-end test completed.")
+
+# ================================================================
+# Cell 10 — Batch Spectrum Test (Multi-sample Evaluation)
+# light sommelier delta energy (Part 3)
+# ================================================================
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ------------------------------------------------
+# 生成不同类型的光谱样本
+# ------------------------------------------------
+def generate_random_spectrum():
+    """
+    生成一个随机光谱，用于测试多样输入：
+    包括：
+      - 随机 Gaussian
+      - 随机多峰
+      - 随机宽带
+    """
+    choice = rng.choice(["gauss", "multi", "wide"])
+
+    if choice == "gauss":
+        c = rng.uniform(420, 680)
+        w = rng.uniform(10, 40)
+        p = rng.uniform(0.5, 1.2)
+        return make_gaussian_spectrum(c, width_nm=w, peak=p)
+
+    elif choice == "multi":
+        # 多峰组合
+        c1 = rng.uniform(430, 500)
+        c2 = rng.uniform(520, 600)
+        s1 = make_gaussian_spectrum(c1, width_nm=rng.uniform(15, 35), peak=rng.uniform(0.4, 1.2))
+        s2 = make_gaussian_spectrum(c2, width_nm=rng.uniform(15, 35), peak=rng.uniform(0.4, 1.2))
+        return np.clip(s1 + s2, 0, None)
+
+    else:  # wide
+        c = rng.uniform(480, 580)
+        w = rng.uniform(50, 120)
+        p = rng.uniform(0.4, 1.0)
+        return make_gaussian_spectrum(c, width_nm=w, peak=p)
+
+
+# ------------------------------------------------
+# 批量运行
+# ------------------------------------------------
+def batch_test_energy_pipeline(
+        N=30,
+        T=40,
+        use_energy_noise=False,
+        recovery_test=None):
+    """
+    对 N 个光谱进行运行，收集 stop_t 和 Δ2(1) 分布。
+    """
+
+    stop_ts = []
+    delta2_first = []
+
+    # phase gate
+    phase_gate = make_phase_gate(T=T)
+
+    for i in range(N):
+        spec = generate_random_spectrum()
+
+        RG, BY, RG_fb, BY_fb, BW, COLOR, Energy_ts, F_vals, stop_t = \
+            run_energy_pipeline(
+                spec,
+                receptor_sens,
+                wavelengths,
+                T=T,
+                gate=phase_gate,
+                use_energy_noise=use_energy_noise,
+                noise_sigma=0.01
+            )
+
+        stop_ts.append(stop_t if stop_t is not None else T)
+
+        # 计算 Δ2
+        d2 = compute_delta2(Energy_ts)
+        delta2_first.append(d2[1])
+
+    return np.array(stop_ts), np.array(delta2_first)
+
+
+# ------------------------------------------------
+# 默认运行 30 个光谱
+# ------------------------------------------------
+stop_ts, delta2_first = batch_test_energy_pipeline(N=30)
+
+print("Batch test finished.")
+print("stop_t values:", stop_ts)
+print("Δ2(1) values:", delta2_first)
+
+# ------------------------------------------------
+# 直方图绘制 Δ2(1) 分布
+# ------------------------------------------------
+plt.figure(figsize=(6,4))
+plt.hist(delta2_first, bins=10, alpha=0.7, edgecolor='black')
+plt.axvline(0, color='red', linestyle='--')
+plt.title("Δ2(1) Distribution Across 30 Spectra")
+plt.xlabel("Δ2(1)")
+plt.ylabel("count")
+plt.show()
+
+# ------------------------------------------------
+# stop_t 分布图
+# ------------------------------------------------
+plt.figure(figsize=(6,4))
+plt.hist(stop_ts, bins=10, alpha=0.7, edgecolor='black')
+plt.title("stop_t Distribution Across 30 Spectra")
+plt.xlabel("stop_t")
+plt.ylabel("count")
+plt.show()
+
+print("Cell 10 OK — Batch spectrum test completed.")
+
+
